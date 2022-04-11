@@ -21,9 +21,9 @@ import sigrokdecode as srd
 from collections import namedtuple
 
 class Ann:
-    BIT, START, STOP, PARITY_OK, PARITY_ERR, DATA, WORD = range(7)
+    BIT, START, STOP, PARITY_OK, ERROR, DATA, WORD, INHIBIT, ACK = range(9)
 
-Bit = namedtuple('Bit', 'val ss es')
+Bit = namedtuple('Bit', 'val cl ms ss es')
 
 class Decoder(srd.Decoder):
     api_version = 3
@@ -44,13 +44,15 @@ class Decoder(srd.Decoder):
         ('start-bit', 'Start bit'),
         ('stop-bit', 'Stop bit'),
         ('parity-ok', 'Parity OK bit'),
-        ('parity-err', 'Parity error bit'),
+        ('error', 'Error'),
         ('data-bit', 'Data bit'),
         ('word', 'Word'),
+        ('inhibit', 'Inhibit'),
+        ('ack', 'Acknowledge'),
     )
     annotation_rows = (
         ('bits', 'Bits', (0,)),
-        ('fields', 'Fields', (1, 2, 3, 4, 5, 6)),
+        ('fields', 'Fields', (1, 2, 3, 4, 5, 6, 7, 8)),
     )
 
     def __init__(self):
@@ -59,68 +61,86 @@ class Decoder(srd.Decoder):
     def reset(self):
         self.bits = []
         self.bitcount = 0
+        self.samplerate = None
+        self.inhibited = False
+
+    def metadata(self, key, value):
+        if key == srd.SRD_CONF_SAMPLERATE:
+            self.samplerate = value
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
 
     def putb(self, bit, ann_idx):
-        b = self.bits[bit]
-        self.put(b.ss, b.es, self.out_ann, [ann_idx, [str(b.val)]])
+        self.put(bit.ss, bit.es, self.out_ann, [ann_idx, [str(bit.val)]])
 
     def putx(self, bit, ann):
-        self.put(self.bits[bit].ss, self.bits[bit].es, self.out_ann, ann)
+        self.put(bit.ss, bit.es, self.out_ann, ann)
 
-    def handle_bits(self, datapin):
-        # Ignore non start condition bits (useful during keyboard init).
-        if self.bitcount == 0 and datapin == 1:
+    def handle_bits(self, datapin, clockpin, previous_sample, microseconds, transition):
+        bit = Bit(datapin, clockpin, microseconds, previous_sample, self.samplenum)
+        if (microseconds > 50) and (clockpin == 1):
+            self.inhibited = False
+            self.bitcount = 0
             return
 
-        # Store individual bits and their start/end samplenumbers.
-        self.bits.append(Bit(datapin, self.samplenum, self.samplenum))
-
-        # Fix up end sample numbers of the bits.
-        if self.bitcount > 0:
-            b = self.bits[self.bitcount - 1]
-            self.bits[self.bitcount - 1] = Bit(b.val, b.ss, self.samplenum)
-        if self.bitcount == 11:
-            self.bitwidth = self.bits[1].es - self.bits[2].es
-            b = self.bits[-1]
-            self.bits[-1] = Bit(b.val, b.ss, b.es + self.bitwidth)
-
-        # Find all 11 bits. Start + 8 data + odd parity + stop.
-        if self.bitcount < 11:
-            self.bitcount += 1
+        if (microseconds > 55) and (clockpin == 0):
+            self.inhibited = True
+            self.bitcount = 0
+            self.put(bit.ss, bit.es, self.out_ann, [Ann.INHIBIT, ['Inhibit']])
             return
 
-        # Extract data word.
-        word = 0
-        for i in range(8):
-            word |= (self.bits[i + 1].val << i)
+        if (self.inhibited ^ clockpin):
+            return
 
-        # Calculate parity.
-        parity_ok = (bin(word).count('1') + self.bits[9].val) % 2 == 1
+        if transition:
+            self.putx(bit, [Ann.ERROR, ['Unexpected Transition', 'UT']])
 
-        # Emit annotations.
-        for i in range(11):
-            self.putb(i, Ann.BIT)
-        self.putx(0, [Ann.START, ['Start bit', 'Start', 'S']])
-        self.put(self.bits[1].ss, self.bits[8].es, self.out_ann, [Ann.WORD,
-                 ['Data: %02x' % word, 'D: %02x' % word, '%02x' % word]])
-        if parity_ok:
-            self.putx(9, [Ann.PARITY_OK, ['Parity OK', 'Par OK', 'P']])
-        else:
-            self.putx(9, [Ann.PARITY_ERR, ['Parity error', 'Par err', 'PE']])
-        self.putx(10, [Ann.STOP, ['Stop bit', 'Stop', 'St', 'T']])
+        self.putb(bit, Ann.BIT)
 
-        self.bits, self.bitcount = [], 0
+        if self.bitcount == 0:
+            if datapin:
+                self.putx(bit, [Ann.ERROR, ['Start bit error', 'SB-E']])
+            else:
+                self.putx(bit, [Ann.START, ['Start bit', 'Start', 'S']])
+            self.word = 0
+            self.parity = 0
+            self.wordstart = self.samplenum
+        elif self.bitcount < 9:
+            self.word |= datapin << (self.bitcount-1)
+            self.parity ^= datapin
+        elif self.bitcount == 9:
+            self.put(self.wordstart, bit.ss, self.out_ann, [Ann.WORD,
+                    ['%s Data: %02x' % ("Host" if self.inhibited else "Device", self.word), '%sD: %02x' % ("H" if self.inhibited else "D", self.word), '%02x' % (self.word)]])
+            if self.parity != datapin:
+                self.putx(bit, [Ann.PARITY_OK, ['Parity OK', 'Par OK', 'P']])
+            else:
+                self.putx(bit, [Ann.ERROR, ['Parity error', 'Par ERR', 'PE']])
+        elif self.bitcount == 10:
+            if datapin:
+                self.putx(bit, [Ann.STOP, ['Stop bit', 'Stop', 'SB', 'S']])
+            else:
+                self.putx(bit, [Ann.ERROR, ['Stop bit error', 'SB-ERR']])
+            self.inhibited = False
+        elif self.bitcount == 11:
+            if datapin:
+                self.putx(bit, [Ann.ERROR, ['Device Acknowledge Error', 'Ack Err', 'A-E']])
+            else:
+                self.putx(bit, [Ann.ACK, ['Device Acknowledge', 'D ACK', 'A']])
+
+        self.bitcount += 1
+
+        return
 
     def decode(self):
+        previous_data, previous_clock = self.wait([])
+        previous_sample = self.samplenum
         while True:
-            # Sample data bits on the falling clock edge (assume the device
-            # is the transmitter). Expect the data byte transmission to end
-            # at the rising clock edge. Cope with the absence of host activity.
-            _, data_pin = self.wait({0: 'f'})
-            self.handle_bits(data_pin)
-            if self.bitcount == 1 + 8 + 1 + 1:
-                _, data_pin = self.wait({0: 'r'})
-                self.handle_bits(data_pin)
+            clock_pin, data_pin = self.wait([{0: 'e'}, {1:'e'}])
+            transition = not(self.matched[0])
+            if transition:
+                clock_pin, data_pin = self.wait([{0: 'e'}])
+            self.handle_bits(previous_data, previous_clock, previous_sample, (self.samplenum - previous_sample) / self.samplerate * 1000000, transition)
+            previous_data = data_pin
+            previous_clock = clock_pin
+            previous_sample = self.samplenum
